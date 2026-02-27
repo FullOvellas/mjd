@@ -1,0 +1,9 @@
+[package]
+name = "mjp"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+mjl = { version = "0.1.0", path = "../mjl" }
+mjd-workspace-hack = { version = "0.1", path = "../mjd-workspace-hack" }
