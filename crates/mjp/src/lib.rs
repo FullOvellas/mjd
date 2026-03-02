@@ -3,22 +3,22 @@ use std::{error::Error, fmt::Display};
 use mjl::{JsonLexer, LexError, Token};
 
 #[derive(Debug)]
-pub struct Json {
-    pub value: Value,
+pub struct Json<'a> {
+    pub value: Value<'a>,
 }
 
 #[derive(Debug)]
-pub struct Pair {
-    pub key: String,
-    pub value: Value,
+pub struct Pair<'a> {
+    pub key: &'a str,
+    pub value: Value<'a>,
 }
 
 #[derive(Debug)]
-pub enum Value {
-    Object(Vec<Pair>),
-    Array(Vec<Value>),
-    Str(String),
-    Number(String),
+pub enum Value<'a> {
+    Object(Vec<Pair<'a>>),
+    Array(Vec<Value<'a>>),
+    Str(&'a str),
+    Number(&'a str),
     Boolean(BooleanVal),
     Null,
 }
@@ -40,12 +40,12 @@ impl Display for BooleanVal {
 
 pub struct JsonParser<'a> {
     pub lexer: JsonLexer<'a>,
-    pub tokens: Vec<Token>,
+    pub tokens: Vec<Token<'a>>,
     pub position: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    fn parse_json(&mut self) -> Result<Json, Box<dyn Error>> {
+    fn parse_json(&mut self) -> Result<Json<'a>, Box<dyn Error>> {
         let value = self.parse_value()?;
 
         if self.current()?.is_some() {
@@ -57,14 +57,13 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<Value, Box<dyn Error>> {
+    fn parse_value(&mut self) -> Result<Value<'a>, Box<dyn Error>> {
         use Token::*;
         use Value::*;
         if let Some(t) = self.current()? {
             let result = match t {
                 LBrace => self.parse_object()?,
                 String(s) => {
-                    let s = s.clone();
                     self.position += 1;
                     Str(s)
                 }
@@ -78,7 +77,6 @@ impl<'a> JsonParser<'a> {
                     Boolean(BooleanVal::False)
                 }
                 Token::Number(n) => {
-                    let n = n.clone();
                     self.position += 1;
                     Value::Number(n)
                 }
@@ -100,7 +98,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<Value, Box<dyn Error>> {
+    fn parse_array(&mut self) -> Result<Value<'a>, Box<dyn Error>> {
         use Token::*;
         use Value::*;
         self.position += 1; // skip over OpenSquareBracket
@@ -126,7 +124,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<Value, Box<dyn Error>> {
+    fn parse_object(&mut self) -> Result<Value<'a>, Box<dyn Error>> {
         self.position += 1;
         let mut pairs = Vec::new();
         let mut seen_keys = std::collections::HashSet::new();
@@ -142,7 +140,7 @@ impl<'a> JsonParser<'a> {
                         self.expect_skip(&Token::Comma)?;
                     }
                     let pair = self.parse_pair()?;
-                    if !seen_keys.insert(pair.key.clone()) {
+                    if !seen_keys.insert(pair.key) {
                         return Err(Box::new(JsonParseError(format!(
                             "duplicate key: {}",
                             pair.key
@@ -155,11 +153,10 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn expect_string(&mut self) -> Result<String, Box<dyn Error>> {
+    fn expect_string(&mut self) -> Result<&'a str, Box<dyn Error>> {
         use Token::*;
         match self.current()? {
             Some(String(s)) => {
-                let s = s.clone();
                 self.position += 1;
                 Ok(s)
             }
@@ -191,7 +188,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn current(&mut self) -> Result<Option<Token>, LexError> {
+    fn current(&mut self) -> Result<Option<Token<'a>>, LexError> {
         let t = self.tokens.get(self.position);
         if let Some(t) = t {
             Ok(Some(t.clone()))
@@ -206,7 +203,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_pair(&mut self) -> Result<Pair, Box<dyn Error>> {
+    fn parse_pair(&mut self) -> Result<Pair<'a>, Box<dyn Error>> {
         let key = self.expect_string()?;
         self.expect_skip(&Token::Colon)?;
         let value = self.parse_value()?;

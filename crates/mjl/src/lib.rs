@@ -5,7 +5,7 @@ use std::fmt::Display;
 use std::str::Chars;
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum Token {
+pub enum Token<'a> {
     LBrace,
     RBrace,
     LBracket,
@@ -14,8 +14,8 @@ pub enum Token {
     Colon,
     True,
     False,
-    Number(String),
-    String(String),
+    Number(&'a str),
+    String(&'a str),
     Null,
 }
 
@@ -33,7 +33,7 @@ lazy_static! {
 }
 
 impl<'a> JsonLexer<'a> {
-    pub fn next_token(&mut self) -> Result<Option<Token>, LexError> {
+    pub fn next_token(&mut self) -> Result<Option<Token<'a>>, LexError> {
         let mut chars = self.input[self.byte_offset..].chars();
         let mut c;
         loop {
@@ -96,27 +96,78 @@ impl<'a> JsonLexer<'a> {
                 }
             }),
             '"' => self.lex_string(chars),
-            n @ '-' | n if n.is_ascii_digit() => {
-                if let Some(m) = NUM_REGEX.captures(&self.input[self.byte_offset..]) {
-                    m.get(1)
-                        .map(|n| {
-                            self.byte_offset += n.len();
-                            Some(Token::Number(n.as_str().to_string()))
-                        })
-                        .ok_or(LexError("no number match found".to_string()))
-                } else {
-                    Err(LexError("unexpected character found".to_string()))
-                }
-            }
+            n @ '-' | n if n.is_ascii_digit() => self.lex_number(chars, n),
             c => Err(LexError(format!("unable to parse token from char {c}"))),
         }
+    }
+
+    fn lex_number(&mut self, chars: Chars<'_>, first: char) -> Result<Option<Token<'a>>, LexError> {
+        let mut chars = chars.peekable();
+        let first_digit = if first == '-' {
+            match chars.peek() {
+                Some(n) if n.is_ascii_digit() => chars.next().unwrap(),
+                _ => {
+                    return Err(LexError(
+                        "invalid number literal, expected digit after `-`".into(),
+                    ));
+                }
+            }
+        } else {
+            first
+        };
+
+        // integer part
+        let mut len = 1;
+        match chars.peek() {
+            Some('0') if first_digit == '0' => {
+                return Err(LexError(
+                    "invalid number literal, no leading zeroes allowed".into(),
+                ));
+            }
+            Some(d) if d.is_ascii_digit() => {
+                while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                    len += 1;
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+
+        // fractional part
+        if matches!(chars.peek(), Some('.')) {
+            len += 1;
+            chars.next(); // skip over dot
+            while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                len += 1;
+                chars.next();
+            }
+        }
+
+        // exponent
+        if matches!(chars.peek(), Some('e') | Some('E')) {
+            len += 1;
+            chars.next(); // skip over e
+            if let Some('-') | Some('+') = chars.peek() {
+                len += 1;
+                chars.next(); // skip over (optional) sign in exponent
+            }
+
+            while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                len += 1;
+                chars.next();
+            }
+        }
+
+        let number = Token::Number(&self.input[self.byte_offset..self.byte_offset + len]);
+        self.byte_offset += len;
+        Ok(Some(number))
     }
 
     fn lex_match<T: FnOnce(&str) -> Option<Token>>(
         &mut self,
         len: usize,
         factory: T,
-    ) -> Result<Option<Token>, LexError> {
+    ) -> Result<Option<Token<'a>>, LexError> {
         let end = (self.byte_offset + len).min(self.input.len());
         let slice = &self.input[self.byte_offset..end];
         match factory(slice) {
@@ -128,12 +179,16 @@ impl<'a> JsonLexer<'a> {
         }
     }
 
-    fn lex_string(&mut self, mut chars: Chars<'_>) -> Result<Option<Token>, LexError> {
-        let mut s = String::new();
+    fn lex_string(&mut self, mut chars: Chars<'_>) -> Result<Option<Token<'a>>, LexError> {
+        self.byte_offset += 1; // skip opening quote
+        let start = self.byte_offset;
+        let mut byte_len = 0;
+
         while let Some(c) = chars.next() {
             if c == '"' {
-                self.byte_offset += s.len() + 2;
-                let result = Ok(Some(Token::String(s)));
+                let end = start + byte_len;
+                let result = Ok(Some(Token::String(&self.input[start..end])));
+                self.byte_offset = end + 1; // skip closing quote
                 return result;
             }
 
@@ -142,36 +197,38 @@ impl<'a> JsonLexer<'a> {
             }
 
             if c == '\\' {
+                byte_len += c.len_utf8();
+
                 match chars.next() {
                     None => break,
-                    Some(e) => match e {
-                        '"' | '\\' | '/' | 'f' | 'n' | 'r' | 't' => {
-                            s.push(c);
-                            s.push(e);
-                            continue;
-                        }
-                        'u' => {
-                            s.push(c);
-                            s.push(e);
-                            for _ in 0..4 {
-                                if let Some(h) = chars.next() {
-                                    if !h.is_ascii_hexdigit() {
-                                        return Err(LexError(
-                                            "invalid unicode escape sequence".to_string(),
-                                        ));
+                    Some(e) => {
+                        byte_len += e.len_utf8();
+
+                        match e {
+                            '"' | '\\' | '/' | 'f' | 'n' | 'r' | 't' => continue,
+                            'u' => {
+                                for _ in 0..4 {
+                                    if let Some(h) = chars.next() {
+                                        if !h.is_ascii_hexdigit() {
+                                            return Err(LexError(
+                                                "invalid unicode escape sequence".to_string(),
+                                            ));
+                                        }
+                                        byte_len += h.len_utf8();
+                                    } else {
+                                        break;
                                     }
-                                    s.push(h);
-                                } else {
-                                    break;
                                 }
                             }
-                            continue;
+                            _ => return Err(LexError("invalid escape sequence".to_string())),
                         }
-                        _ => return Err(LexError("invalid escape sequence".to_string())),
-                    },
+                    }
                 }
+
+                continue;
             }
-            s.push(c);
+
+            byte_len += c.len_utf8();
         }
 
         Err(LexError("unclosed string literal".to_string()))
@@ -201,29 +258,17 @@ mod test {
         };
 
         assert_eq!(Ok(Some(Token::LBrace)), lexer.next_token());
-        assert_eq!(
-            Ok(Some(Token::String("asdf".to_string()))),
-            lexer.next_token()
-        );
+        assert_eq!(Ok(Some(Token::String("asdf"))), lexer.next_token());
         assert_eq!(Ok(Some(Token::Colon)), lexer.next_token());
-        assert_eq!(Ok(Some(Token::Number("1".to_string()))), lexer.next_token());
+        assert_eq!(Ok(Some(Token::Number("1"))), lexer.next_token());
         assert_eq!(Ok(Some(Token::Comma)), lexer.next_token());
-        assert_eq!(
-            Ok(Some(Token::String("🗻∈🌏".to_string()))),
-            lexer.next_token()
-        );
+        assert_eq!(Ok(Some(Token::String("🗻∈🌏"))), lexer.next_token());
         assert_eq!(Ok(Some(Token::Colon)), lexer.next_token());
         assert_eq!(Ok(Some(Token::True)), lexer.next_token());
         assert_eq!(Ok(Some(Token::Comma)), lexer.next_token());
-        assert_eq!(
-            Ok(Some(Token::String("🗻".to_string()))),
-            lexer.next_token()
-        );
+        assert_eq!(Ok(Some(Token::String("🗻"))), lexer.next_token());
         assert_eq!(Ok(Some(Token::Colon)), lexer.next_token());
-        assert_eq!(
-            Ok(Some(Token::Number("42".to_string()))),
-            lexer.next_token()
-        );
+        assert_eq!(Ok(Some(Token::Number("42"))), lexer.next_token());
         assert_eq!(Ok(Some(Token::RBrace)), lexer.next_token());
     }
 
@@ -302,7 +347,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::String("asdf".to_string()))),
+            Ok(Some(Token::String("asdf"))),
             JsonLexer {
                 input: "\"asdf\"",
                 byte_offset: 0
@@ -310,7 +355,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::String(r#"as\"df"#.to_string()))),
+            Ok(Some(Token::String(r#"as\"df"#))),
             JsonLexer {
                 input: r#""as\"df""#,
                 byte_offset: 0
@@ -318,7 +363,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::String(r#"as\uFFFFdf"#.to_string()))),
+            Ok(Some(Token::String(r#"as\uFFFFdf"#))),
             JsonLexer {
                 input: r#""as\uFFFFdf""#,
                 byte_offset: 0
@@ -326,7 +371,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1".to_string()))),
+            Ok(Some(Token::Number("1"))),
             JsonLexer {
                 input: "1",
                 byte_offset: 0
@@ -334,7 +379,23 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2".to_string()))),
+            Ok(Some(Token::Number("0"))),
+            JsonLexer {
+                input: "0",
+                byte_offset: 0
+            }
+            .next_token()
+        );
+        assert_eq!(
+            Ok(Some(Token::Number("10"))),
+            JsonLexer {
+                input: "10",
+                byte_offset: 0
+            }
+            .next_token()
+        );
+        assert_eq!(
+            Ok(Some(Token::Number("1.2"))),
             JsonLexer {
                 input: "1.2",
                 byte_offset: 0
@@ -342,7 +403,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2E2".to_string()))),
+            Ok(Some(Token::Number("1.2E2"))),
             JsonLexer {
                 input: "1.2E2",
                 byte_offset: 0
@@ -350,7 +411,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2E-2".to_string()))),
+            Ok(Some(Token::Number("1.2E-2"))),
             JsonLexer {
                 input: "1.2E-2",
                 byte_offset: 0
@@ -358,7 +419,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2E+2".to_string()))),
+            Ok(Some(Token::Number("1.2E+2"))),
             JsonLexer {
                 input: "1.2E+2",
                 byte_offset: 0
@@ -366,7 +427,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2e2".to_string()))),
+            Ok(Some(Token::Number("1.2e2"))),
             JsonLexer {
                 input: "1.2e2",
                 byte_offset: 0
@@ -374,7 +435,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2e-2".to_string()))),
+            Ok(Some(Token::Number("1.2e-2"))),
             JsonLexer {
                 input: "1.2e-2",
                 byte_offset: 0
@@ -382,7 +443,7 @@ mod test {
             .next_token()
         );
         assert_eq!(
-            Ok(Some(Token::Number("1.2e+2".to_string()))),
+            Ok(Some(Token::Number("1.2e+2"))),
             JsonLexer {
                 input: "1.2e+2",
                 byte_offset: 0
